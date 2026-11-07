@@ -21,18 +21,15 @@ from spotipy.oauth2 import SpotifyOAuth
 scope = "user-library-read,user-read-playback-state,user-modify-playback-state,user-read-currently-playing,app-remote-control,streaming"
 sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope, client_id=os.getenv("SP_CLIENT"), client_secret=os.getenv("SP_SECRET"), redirect_uri=os.getenv("SP_REDIR")))
 
-
 if TYPE_CHECKING:
     import sqlite3
 
-
 LOGGER: logging.Logger = logging.getLogger("Bot")
 
-# Consider using a .env or another form of Configuration file!
 CLIENT_ID: str = os.getenv("CLIENT")  # The CLIENT ID from the Twitch Dev Console
 CLIENT_SECRET: str = os.getenv("SECRET")  # The CLIENT SECRET from the Twitch Dev Console
-BOT_ID = os.getenv("BOT")  # The Account ID of the bot user...
-OWNER_ID = os.getenv("USER")  # Your personal User ID..
+BOT_ID = os.getenv("BOT")  # The Account ID of the bot user
+OWNER_ID = os.getenv("USER")  # personal User ID
 
 
 class Bot(commands.AutoBot):
@@ -54,15 +51,52 @@ class Bot(commands.AutoBot):
         await self.add_component(CommandComponent(self))
 
     async def custom_prefix(self, bot, message: twitchio.ChatMessage) -> None:
-        # The prefix will be ? if the chatters name startswith "cool"
-        # Otherwise it will default to "!"
-        # This coroutine can be used to connect to a cache or database etc to provide
-        # custom settable prefixes for example...
-
+        # this is just so "gup" registers as a full command
         if "gup" == message.text:
             return "g"
 
         return "!"
+
+    # handles all reward requests
+    async def event_custom_redemption_add(self, payload: twitchio.ChannelPointsAutoRedeemAdd) -> None:
+        if payload.reward.title == "skip song":
+            sp.next_track()
+        elif payload.reward.title == "song request":
+            if "open.spotify.com/track" in payload.user_input:
+                temp_list = payload.user_input.split(" ")
+                for text in temp_list:
+                    if "open.spotify.com/track" in text:
+                        sp.add_to_queue(text)
+                        break
+        elif payload.reward.title == "+1":
+            clean_input = payload.user_input.strip()
+            # totally protects me from sql injection smiles
+            if " " in clean_input:
+                return
+
+            clean_input = clean_input.replace("@", "")
+            if not clean_input.isalnum():
+                return
+
+            if clean_input == payload.user.name:
+                return
+
+            async with asqlite.connect('viewer.db') as db:
+                async with db.cursor() as cursor:
+                    # there is a way to fix this where it will award points only to valid twitch users
+                    # however, i do not feel like doing that right now(tm) so later me problem
+                    rows: list[sqlite3.Row] = await db.fetchall(f"SELECT num FROM viewer WHERE user = '{clean_input}'")
+                    if len(rows) > 0:
+                        await cursor.execute(f"UPDATE viewer SET num = num + 1 WHERE user = '{clean_input}'")
+                        await db.commit()
+                    else:
+                        await cursor.execute("INSERT INTO viewer VALUES (?, ?)", (f"{clean_input}", 1))
+                        await db.commit()
+
+    # needs testing while live! possibly sending in the wrong context
+    async def event_ad_break(self, payload: twitchio.ChannelAdBreakBegin) -> None:
+        user = self.create_partialuser(user_id=self.owner_id)
+        await user.send_message(sender=self.user, message=f"ad break starting for {payload.duration} gupset")
 
     async def event_oauth_authorized(self, payload: twitchio.authentication.UserTokenPayload) -> None:
         await self.add_token(payload.access_token, payload.refresh_token)
@@ -77,6 +111,8 @@ class Bot(commands.AutoBot):
         # A list of subscriptions we would like to make to the newly authorized channel...
         subs: list[eventsub.SubscriptionPayload] = [
             eventsub.ChatMessageSubscription(broadcaster_user_id=payload.user_id, user_id=self.bot_id),
+            eventsub.ChannelPointsAutoRedeemV2Subscription(broadcaster_user_id=payload.user_id),
+            eventsub.ChannelPointsRedeemAddSubscription(broadcaster_user_id=payload.user_id),
         ]
 
         resp: twitchio.MultiSubscribePayload = await self.multi_subscribe(subs)
@@ -112,16 +148,44 @@ class CommandComponent(commands.Component):
     # You can use Components within modules for a more organized codebase and hot-reloading.
 
     def __init__(self, bot: Bot) -> None:
-        # Passing args is not required...
-        # We pass bot here as an example...
         self.bot = bot
         self.gup_time = datetime.now()
+        self.np_time = datetime.now()
+        self.ss_time = datetime.now()
+
+        self.count_name = ""
+        self.count_curr = 0
+        self.count_max = 0
+        self.count_streak = False
 
     # An example of listening to an event
     # We use a listener in our Component to display the messages received.
     @commands.Component.listener()
     async def event_message(self, payload: twitchio.ChatMessage) -> None:
-        print(f"[{payload.broadcaster.name}] - {payload.chatter.name}: {payload.text}")
+        # print(f"[{payload.broadcaster.name}] - {payload.chatter.name}: {payload.text}")
+        print(f"{payload.chatter.name}: {payload.text}")
+        if payload.text.isnumeric() and payload.chatter.name != self.count_name:
+            text_num = int(payload.text)
+            if self.count_curr == text_num - 1:
+                self.count_curr += 1
+                self.count_name = payload.chatter.name
+                if self.count_curr > self.count_max:
+                    self.count_max = self.count_curr
+                    self.count_streak = True
+            else:
+                if self.count_streak:
+                    user = self.bot.create_partialuser(user_id=self.bot.owner_id)
+                    await user.send_message(sender=self.bot.user, message=f"new counting record of {self.count_max}!")
+                self.count_curr = 0
+                self.count_streak = False
+                self.count_name = payload.chatter.name
+
+        # can move the gup command here so it is less jank but i think gup is important enough to have its own command
+
+        if "67" in payload.text and datetime.now() > self.ss_time:
+            user = self.bot.create_partialuser(user_id=self.bot.owner_id)
+            self.ss_time = datetime.now() + timedelta(minutes=67)
+            await user.send_message(sender=self.bot.user, message=f"did someone say... nay... i shan't participate too.")
 
     @commands.command(aliases=["gupcord"])
     async def discord(self, ctx: commands.Context) -> None:
@@ -130,7 +194,7 @@ class CommandComponent(commands.Component):
         !discord
         !gupcord
         """
-        await ctx.reply(f"Join the gupcord here! https://discord.gg/FbtcAN5Ynh")
+        await ctx.reply(f"Join the gupcord here! https://discord.gg/{os.getenv('DISCORD')}")
 
     @commands.command()
     async def up(self, ctx: commands.Context) -> None:
@@ -142,7 +206,7 @@ class CommandComponent(commands.Component):
             print("unable to gup.")
             return
         else:
-            self.gup_time = datetime.now() + timedelta(seconds=37)
+            self.gup_time = datetime.now() + timedelta(seconds=13)
         await ctx.reply(f"gup")
 
     @commands.command(aliases=["np"])
@@ -152,8 +216,14 @@ class CommandComponent(commands.Component):
         !np
         !nowplaying
         """
+        if datetime.now() <= self.np_time:
+            return
+
+        self.np_time = datetime.now() + timedelta(seconds=13)
         playback = sp.current_playback()
-        if playback['is_playing'] is False:
+        if playback is None:
+            await ctx.reply("nothing is currently playing on spotify")
+        elif playback['is_playing'] is False:
             await ctx.reply("nothing is currently playing on spotify")
         else:
             current_s = playback['progress_ms']//1000
@@ -178,6 +248,62 @@ class CommandComponent(commands.Component):
                 else:
                     artists += f", {name}"
             await ctx.reply(f"meows is currently listening to {song_name} by {artists} ({current_play}/{total_play})")
+
+    @commands.command(aliases=["counting"])
+    async def count(self, ctx: commands.Context) -> None:
+        """Command for reporting the current instance counting record!
+
+        !counting
+        !count
+        """
+        if self.count_max == 67:
+            await ctx.reply(f"SIIIIX SEVEN HAHAHAHA IT'S SIX SQUEAKIN' SEVEN HAHAHAH AAAAAA")
+        elif self.count_max == 6:
+            await ctx.reply(f"six............. it's six.....")
+        elif self.count_max == 7:
+            await ctx.reply(f"s-s-seven........ yes. it's seven.")
+        else:
+            await ctx.reply(f"current counting record is {self.count_max}!")
+
+    @commands.command(aliases=["pts", "points"])
+    async def audit(self, ctx: commands.Context, *user: str) -> None:
+        """Command for checking how many points the user has been awarded.
+        Additional optional argument for another user.
+
+        !audit [user]
+        !points [user]
+        !pts [user]
+        """
+        async with asqlite.connect('viewer.db') as db:
+            async with db.cursor() as cursor:
+                # there is a way to fix this where it will award points only to valid twitch users
+                # however, i do not feel like doing that right now(tm) so later me problem
+                if len(user) == 0:
+                    rows: list[sqlite3.Row] = await db.fetchall(f"SELECT num FROM viewer WHERE user = '{ctx.author.name}'")
+                    if len(rows) > 0:
+                        if rows[0][0] == 1:
+                            await ctx.reply(f"{ctx.author.name} has {rows[0][0]} point!")
+                        else:
+                            await ctx.reply(f"{ctx.author.name} has {rows[0][0]} points!")
+                    else:
+                        await cursor.execute("INSERT INTO viewer VALUES (?, ?)", (f"{ctx.author.name}", 0))
+                        await db.commit()
+                        await ctx.reply(f"{ctx.author.name} has 0 points!")
+                else:
+                    clean_input = user[0]
+                    clean_input = clean_input.replace("@", "")
+                    if not clean_input.isalnum():
+                        return
+                    rows: list[sqlite3.Row] = await db.fetchall(f"SELECT num FROM viewer WHERE user = '{clean_input}'")
+                    if len(rows) > 0:
+                        if rows[0][0] == 1:
+                            await ctx.reply(f"{clean_input} has {rows[0][0]} point!")
+                        else:
+                            await ctx.reply(f"{clean_input} has {rows[0][0]} points!")
+                    else:
+                        await cursor.execute("INSERT INTO viewer VALUES (?, ?)", (f"{clean_input}", 0))
+                        await db.commit()
+                        await ctx.reply(f"{clean_input} has 0 points!")
 
     # @commands.command()
     # async def say(self, ctx: commands.Context, *, message: str) -> None:
@@ -236,9 +362,8 @@ class CommandComponent(commands.Component):
     #     await ctx.send("discord.gg/...")
 
 
-async def setup_tdb(db: asqlite.Pool) -> tuple[list[tuple[str, str]], list[eventsub.SubscriptionPayload]]:
+async def setup_tdb(db: asqlite.Pool) -> tuple[list[tuple[str, str]], list[eventsub.SubscriptionPayload]]: 
     # Create our token table, if it doesn't exist..
-    # You should add the created files to .gitignore or potentially store them somewhere safer
     # This is just for example purposes...
 
     query = """CREATE TABLE IF NOT EXISTS tokens(user_id TEXT PRIMARY KEY, token TEXT NOT NULL, refresh TEXT NOT NULL)"""
@@ -257,12 +382,24 @@ async def setup_tdb(db: asqlite.Pool) -> tuple[list[tuple[str, str]], list[event
             if row["user_id"] == BOT_ID:
                 continue
 
-            subs.extend([eventsub.ChatMessageSubscription(broadcaster_user_id=row["user_id"], user_id=BOT_ID)])
+            subs.extend([eventsub.ChatMessageSubscription(broadcaster_user_id=row["user_id"], user_id=BOT_ID),
+                         eventsub.ChannelPointsAutoRedeemV2Subscription(broadcaster_user_id=row["user_id"]),
+                         eventsub.ChannelPointsRedeemAddSubscription(broadcaster_user_id=row["user_id"])])
 
     return tokens, subs
 
 
-# async def setup_viewerdb(db: asqlite.Pool) -> tuple[list[tuple[str, str]], list[eventsub.SubscriptionPayload]]:
+async def setup_viewer() -> None:
+    async with asqlite.connect('viewer.db') as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                CREATE TABLE IF NOT EXISTS viewer (
+                    user TEXT PRIMARY KEY,
+                    num INT
+                )
+            """)
+            await db.commit()
+
 
 # Our main entry point for our Bot
 # Best to setup_logging here, before anything starts
@@ -270,6 +407,7 @@ def main() -> None:
     twitchio.utils.setup_logging(level=logging.INFO)
 
     async def runner() -> None:
+        await setup_viewer()
         async with asqlite.create_pool("tokens.db") as tdb:
             tokens, subs = await setup_tdb(tdb)
 
