@@ -18,11 +18,9 @@ from twitchio.ext import commands
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
-scope = "user-library-read,user-read-playback-state,user-modify-playback-state,user-read-currently-playing,app-remote-control,streaming"
-sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope, client_id=os.getenv("SP_CLIENT"), client_secret=os.getenv("SP_SECRET"), redirect_uri=os.getenv("SP_REDIR")))
+SP_SCOPE: str = "user-library-read,user-read-playback-state,user-modify-playback-state,user-read-currently-playing,app-remote-control,streaming"
 
-if TYPE_CHECKING:
-    import sqlite3
+import sqlite3
 
 LOGGER: logging.Logger = logging.getLogger("Bot")
 
@@ -59,6 +57,9 @@ class Bot(commands.AutoBot):
 
     # handles all reward requests
     async def event_custom_redemption_add(self, payload: twitchio.ChannelPointsAutoRedeemAdd) -> None:
+        # spotify redeems
+        if "song" in payload.reward.title:
+            sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=SP_SCOPE, client_id=os.getenv("SP_CLIENT"), client_secret=os.getenv("SP_SECRET"), redirect_uri=os.getenv("SP_REDIR")))
         if payload.reward.title == "skip song":
             sp.next_track()
         elif payload.reward.title == "song request":
@@ -68,6 +69,8 @@ class Bot(commands.AutoBot):
                     if "open.spotify.com/track" in text:
                         sp.add_to_queue(text)
                         break
+        
+        # audit redeems
         elif payload.reward.title == "+1":
             clean_input = payload.user_input.strip()
             # totally protects me from sql injection smiles
@@ -80,6 +83,8 @@ class Bot(commands.AutoBot):
 
             if clean_input == payload.user.name:
                 return
+
+            clean_input = clean_input.lower()
 
             async with asqlite.connect('viewer.db') as db:
                 async with db.cursor() as cursor:
@@ -153,9 +158,15 @@ class CommandComponent(commands.Component):
         self.np_time = datetime.now()
         self.ss_time = datetime.now()
 
+        db = sqlite3.connect("viewer.db")
+        cursor = db.cursor()
+        res = cursor.execute("SELECT count FROM leaderboard")
+        lb_max = int(res.fetchone()[0])
+
         self.count_name = ""
         self.count_curr = 0
-        self.count_max = 0
+        self.count_max = lb_max
+        self.count_record = False
         self.count_streak = False
 
     # An example of listening to an event
@@ -164,20 +175,31 @@ class CommandComponent(commands.Component):
     async def event_message(self, payload: twitchio.ChatMessage) -> None:
         # print(f"[{payload.broadcaster.name}] - {payload.chatter.name}: {payload.text}")
         print(f"{payload.chatter.name}: {payload.text}")
-        if payload.text.isnumeric() and payload.chatter.name != self.count_name:
+        if payload.text.isnumeric():
             text_num = int(payload.text)
-            if self.count_curr == text_num - 1:
+            if self.count_curr == text_num - 1 and payload.chatter.name != self.count_name:
+                if text_num == 5:
+                    user = self.bot.create_partialuser(user_id=self.bot.owner_id)
+                    await user.send_message(sender=self.bot.user, message=f"gulp ... a streak of 5...")
+                    self.count_streak = True
                 self.count_curr += 1
                 self.count_name = payload.chatter.name
                 if self.count_curr > self.count_max:
                     self.count_max = self.count_curr
-                    self.count_streak = True
+                    self.count_record = True
             else:
-                if self.count_streak:
+                if self.count_record:
+                    async with asqlite.connect('viewer.db') as db:
+                        async with db.cursor() as cursor:
+                            await cursor.execute(f"UPDATE leaderboard SET count = {self.count_max}")
+                            await db.commit()
                     user = self.bot.create_partialuser(user_id=self.bot.owner_id)
                     await user.send_message(sender=self.bot.user, message=f"new counting record of {self.count_max}!")
+                elif self.count_streak:
+                    user = self.bot.create_partialuser(user_id=self.bot.owner_id)
+                    await user.send_message(sender=self.bot.user, message=f"better luck next time... streak dies at {self.count_curr}...")    
                 self.count_curr = 0
-                self.count_streak = False
+                self.count_record = False
                 self.count_name = payload.chatter.name
 
         # can move the gup command here so it is less jank but i think gup is important enough to have its own command
@@ -219,6 +241,7 @@ class CommandComponent(commands.Component):
         if datetime.now() <= self.np_time:
             return
 
+        sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=SP_SCOPE, client_id=os.getenv("SP_CLIENT"), client_secret=os.getenv("SP_SECRET"), redirect_uri=os.getenv("SP_REDIR")))
         self.np_time = datetime.now() + timedelta(seconds=13)
         playback = sp.current_playback()
         if playback is None:
@@ -257,7 +280,7 @@ class CommandComponent(commands.Component):
         !count
         """
         if self.count_max == 67:
-            await ctx.reply(f"SIIIIX SEVEN HAHAHAHA IT'S SIX SQUEAKIN' SEVEN HAHAHAH AAAAAA")
+            await ctx.reply(f"the record is SIIIIX SEVEN HAHAHAHA IT'S SIX SQUEAKIN' SEVEN HAHAHAH AAAAAA")
         elif self.count_max == 6:
             await ctx.reply(f"six............. it's six.....")
         elif self.count_max == 7:
@@ -292,6 +315,7 @@ class CommandComponent(commands.Component):
                 else:
                     clean_input = user[0]
                     clean_input = clean_input.replace("@", "")
+                    clean_input = clean_input.lower()
                     if not clean_input.isalnum():
                         return
                     rows: list[sqlite3.Row] = await db.fetchall(f"SELECT num FROM viewer WHERE user = '{clean_input}'")
@@ -304,6 +328,27 @@ class CommandComponent(commands.Component):
                         await cursor.execute("INSERT INTO viewer VALUES (?, ?)", (f"{clean_input}", 0))
                         await db.commit()
                         await ctx.reply(f"{clean_input} has 0 points!")
+
+    # if i run out of things to do, add pages to this with optional input
+    @commands.command(aliases=["lb", "leaderboard", "ptsleaderboard"])
+    async def ptslb(self, ctx: commands.Context) -> None:
+        """Command for checking the points leaderboard from the database.
+        
+        !lb
+        !leaderboard
+        !ptsleaderboard
+        !ptslb
+        """
+
+        res = "The top 5 point leaders are: "
+        async with asqlite.connect('viewer.db') as db:
+            async with db.cursor() as cursor:
+                rows: list[sqlite3.Row] = await db.fetchall(f"SELECT user, num FROM viewer ORDER BY num DESC")
+                for num, user in enumerate(rows):
+                    if num == 5:
+                        break
+                    res += f"#{num+1}: {user[0]} at {user[1]}pts; "
+        await ctx.reply(f"{res}")
 
     # @commands.command()
     # async def say(self, ctx: commands.Context, *, message: str) -> None:
@@ -396,6 +441,13 @@ async def setup_viewer() -> None:
                 CREATE TABLE IF NOT EXISTS viewer (
                     user TEXT PRIMARY KEY,
                     num INT
+                )
+            """)
+            await db.commit()
+            await cursor.execute("""
+                CREATE TABLE IF NOT EXISTS leaderboard (
+                    count INT,
+                    sixseven INT
                 )
             """)
             await db.commit()

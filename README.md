@@ -53,7 +53,5 @@ Primary purpose of this project is both to add some fun functionality to Twitch 
 
 # Necessary Integrations for Plans
 - Bungie API for Destiny for pulling Destiny items / FFXIV third party API for pulling XIV items
-- Spotify API for song requesting directly
-- Twitch API for reading channel states, chat, and other information
 - OBS Connectivity for changing stream elements based on chat
 - Discord API for sending messages and relaying user information
